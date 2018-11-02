@@ -3,7 +3,6 @@ package dockerdns
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"strings"
 
@@ -38,23 +37,37 @@ func setup(c *caddy.Controller) error {
 		if err != nil {
 			panic(err)
 		}
-		containers, err := cli.ContainerList(context.Background(), types.ContainerListOptions{})
-		if err != nil {
-			panic(err)
-		}
-
-		nameMap := make(map[string]string)
-		for _, container := range containers {
-			for _, n := range container.Names {
-				nameMap[n[1:]] = container.ID
-			}
-		}
-		return &Handler{
+		h := &Handler{
 			client: cli,
-			names:  nameMap,
 		}
+		h.RefreshNames()
+		go func() {
+			c, _ := cli.Events(context.Background(), types.EventsOptions{})
+			for {
+				e := <-c
+				if e.Type == "container" && (e.Action == "start" || e.Action == "die" || e.Action == "stop") {
+					h.RefreshNames()
+				}
+			}
+		}()
+
+		return h
 	})
 	return nil
+}
+
+func (h *Handler) RefreshNames() {
+	containers, err := h.client.ContainerList(context.Background(), types.ContainerListOptions{})
+	if err != nil {
+		panic(err)
+	}
+	nameMap := make(map[string]string)
+	for _, container := range containers {
+		for _, n := range container.Names {
+			nameMap[n[1:]] = container.ID
+		}
+	}
+	h.names = nameMap
 }
 
 func (h *Handler) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
@@ -68,16 +81,11 @@ func (h *Handler) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 
 	if id, ok := h.names[n]; ok {
 		c, err := h.client.ContainerInspect(context.Background(), id)
-		if err != nil {
-			return 0, err
+		if err == nil {
+			ip = net.ParseIP(c.NetworkSettings.IPAddress)
 		}
-		ip = net.ParseIP(c.NetworkSettings.IPAddress)
-	} else {
-		log.Printf("Container %s not found", n)
-		log.Println("Available containers:")
-		for k, v := range h.names {
-			log.Printf("%s:%s", k, v)
-		}
+	}
+	if ip == nil {
 		a.SetRcode(r, dns.RcodeNameError)
 		a.Ns = []dns.RR{soa(state.QName())}
 		w.WriteMsg(a)
